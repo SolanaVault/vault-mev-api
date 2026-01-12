@@ -1,0 +1,15 @@
+[package]
+name = "vault-mev-api"
+version = "0.1.0"
+edition = "2021"
+authors = [""]
+description = "Agave Validator Plugin API for Vault MEV strategies"
+
+[lib]
+name = "vault_mev_api"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = ">=1", features = ["derive"] }
+solana-clock = { version = ">=3" }
+solana-pubkey = { version = ">=3", features = ["serde"] }
