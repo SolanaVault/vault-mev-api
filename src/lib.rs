@@ -98,8 +98,7 @@ pub struct TxWithAccountsUpdate {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MessageContent {
     Slot(SlotUpdate),
-    Transaction(TxUpdate),
-    TransactionWithAccounts(TxWithAccountsUpdate),
+    TransactionWithAccounts(Vec<TxWithAccountsUpdate>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
