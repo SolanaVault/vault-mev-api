@@ -61,7 +61,6 @@ pub struct SlotUpdate {
     pub parent: Option<u64>,
     pub status: SlotStatus,
     pub recent_blockhash: Option<[u8; 32]>,
-    pub block_time: Option<UnixTimestamp>,
 }
 
 /// Slot status mirrored from `agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus`.
@@ -77,20 +76,12 @@ pub enum SlotStatus {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TxUpdate {
-    pub signature: String,
-    pub is_vote: bool,
-    pub status: String,
-    pub slot: Slot,
-    pub index: Option<usize>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct TxWithAccountsUpdate {
     pub signature: String,
     pub is_vote: bool,
     pub status: String,
     pub slot: Slot,
+    pub chain_unix_timestamp: i64,
     pub index: Option<usize>,
     pub writable_accounts: Vec<AccountInfo>,
 }
