@@ -73,6 +73,7 @@ pub enum SlotStatus {
     Completed,
     CreatedBank,
     Dead(String),
+    Pruned,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
