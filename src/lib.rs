@@ -41,9 +41,15 @@ pub enum ControlMessage {
         simulate: bool,
         threshold_bps: u16,
     },
-    /// A client must send KeepAlive periodically, one KeepAlive message sent allows for 
-    /// MAX_MESSAGES_PER_KEEPALIVE messages to be sent back from the server before another 
-    /// KeepAlive is required. 
+    SimulateTx {
+        request_id: u64,
+        tx: Vec<u8>,
+        sig_verify: bool,
+        replace_recent_blockhash: bool,
+    },
+    /// A client must send KeepAlive periodically, one KeepAlive message sent allows for
+    /// MAX_MESSAGES_PER_KEEPALIVE messages to be sent back from the server before another
+    /// KeepAlive is required.
     KeepAlive,
 }
 
@@ -83,15 +89,28 @@ pub struct TxWithAccountsUpdate {
     pub is_vote: bool,
     pub status: String,
     pub slot: Slot,
-    pub chain_unix_timestamp: i64,
+    pub chain_unix_timestamp: UnixTimestamp,
     pub index: Option<usize>,
     pub writable_accounts: Vec<AccountInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SimulateTxUpdate {
+    pub request_id: u64,
+    pub status: String,
+    pub slot: Slot,
+    pub err: Option<String>,
+    pub logs: Vec<String>,
+    pub units_consumed: u64,
+    pub loaded_accounts_data_size: u32,
+    pub fee: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MessageContent {
     Slot(SlotUpdate),
     TransactionWithAccounts(Vec<TxWithAccountsUpdate>),
+    SimulateTx(SimulateTxUpdate),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
