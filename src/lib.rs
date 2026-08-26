@@ -106,11 +106,29 @@ pub struct SimulateTxUpdate {
     pub fee: Option<u64>,
 }
 
+/// Authoritative current-state push for specific accounts.
+///
+/// Sent after a `SetSubscriptions` replace carries newly-added literal accounts: the
+/// updates stream only delivers account bytes when a matching transaction writes the
+/// account, so without this push a freshly subscribed low-activity account would stay
+/// at whatever stale bytes the client last held until its next natural on-chain write.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccountSnapshotUpdate {
+    /// Working-bank slot the accounts were read from.
+    pub slot: Slot,
+    /// Accounts exactly as read from the working bank (missing accounts are omitted).
+    pub accounts: Vec<AccountInfo>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MessageContent {
     Slot(SlotUpdate),
     TransactionWithAccounts(Vec<TxWithAccountsUpdate>),
     SimulateTx(SimulateTxUpdate),
+    /// Appended last: bincode encodes variants positionally, so mixed-version
+    /// deployments break if a server newer than the client sends this. Deploy
+    /// clients before enabling server-side snapshots.
+    AccountSnapshot(AccountSnapshotUpdate),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
