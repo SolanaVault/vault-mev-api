@@ -13,3 +13,6 @@ path = "src/lib.rs"
 serde = { version = ">=1", features = ["derive"] }
 solana-clock = { version = ">=3" }
 solana-pubkey = { version = ">=3", features = ["serde"] }
+
+[dev-dependencies]
+bincode = "1"

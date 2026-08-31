@@ -7,6 +7,37 @@ use {
 /// Maximum number of messages that can be sent from server to client after a single
 /// KeepAlive control message from the client.
 pub const MAX_MESSAGES_PER_KEEPALIVE: u64 = 10000;
+pub const STREAM_PROTOCOL_VERSION: u16 = 2;
+pub type StreamSessionId = [u8; 16];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedProtocolVersion {
+    pub received: u16,
+    pub supported: u16,
+}
+
+impl std::fmt::Display for UnsupportedProtocolVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unsupported Vault-MEV stream protocol version {} (supported {})",
+            self.received, self.supported
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedProtocolVersion {}
+
+pub fn validate_protocol_version(version: u16) -> Result<(), UnsupportedProtocolVersion> {
+    if version == STREAM_PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(UnsupportedProtocolVersion {
+            received: version,
+            supported: STREAM_PROTOCOL_VERSION,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MemcmpFilter {
@@ -34,7 +65,37 @@ pub struct SubscriptionConfig {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum ControlMessage {
-    SetSubscriptions(SubscriptionConfig),
+    OpenStream {
+        protocol_version: u16,
+        session_id: StreamSessionId,
+        config: SubscriptionConfig,
+        pumpfun_hints: Vec<Pubkey>,
+    },
+    SubscribeAccounts {
+        session_id: StreamSessionId,
+        request_id: u64,
+        accounts: Vec<Pubkey>,
+    },
+    CompactAccounts {
+        session_id: StreamSessionId,
+        request_id: u64,
+        base_membership_generation: u64,
+        retain: Vec<Pubkey>,
+    },
+    SetFilters {
+        session_id: StreamSessionId,
+        request_id: u64,
+        filters: Vec<AccountFilter>,
+    },
+    SetPumpfunHints {
+        session_id: StreamSessionId,
+        request_id: u64,
+        bonding_curves: Vec<Pubkey>,
+    },
+    ReplayFrom {
+        session_id: StreamSessionId,
+        sequence: u64,
+    },
     SubmitTx {
         tx: Vec<u8>,
         enqueue: bool,
@@ -106,34 +167,174 @@ pub struct SimulateTxUpdate {
     pub fee: Option<u64>,
 }
 
-/// Authoritative current-state push for specific accounts.
-///
-/// Sent after a `SetSubscriptions` replace carries newly-added literal accounts: the
-/// updates stream only delivers account bytes when a matching transaction writes the
-/// account, so without this push a freshly subscribed low-activity account would stay
-/// at whatever stale bytes the client last held until its next natural on-chain write.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AccountSnapshotUpdate {
-    /// Working-bank slot the accounts were read from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamOpenedUpdate {
+    pub protocol_version: u16,
+    pub membership_generation: u64,
+    pub filter_generation: u64,
+    pub pumpfun_hint_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountsActivatedUpdate {
+    pub request_id: u64,
+    pub membership_generation: u64,
+    /// Completed-bank slot used for the authoritative account image.
     pub slot: Slot,
-    /// Accounts exactly as read from the working bank (missing accounts are omitted).
+    pub chunk_index: u32,
+    pub chunk_count: u32,
     pub accounts: Vec<AccountInfo>,
+    /// Requested keys that were absent from the completed bank.
+    pub missing: Vec<Pubkey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountsCompactedUpdate {
+    pub request_id: u64,
+    pub membership_generation: u64,
+    pub physical_account_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AppliedControlKind {
+    Filters,
+    PumpfunHints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlAppliedUpdate {
+    pub request_id: u64,
+    pub kind: AppliedControlKind,
+    pub generation: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MessageContent {
+    StreamOpened(StreamOpenedUpdate),
     Slot(SlotUpdate),
     TransactionWithAccounts(Vec<TxWithAccountsUpdate>),
     SimulateTx(SimulateTxUpdate),
-    /// Appended last: bincode encodes variants positionally, so mixed-version
-    /// deployments break if a server newer than the client sends this. Deploy
-    /// clients before enabling server-side snapshots.
-    AccountSnapshot(AccountSnapshotUpdate),
+    AccountsActivated(AccountsActivatedUpdate),
+    AccountsCompacted(AccountsCompactedUpdate),
+    ControlApplied(ControlAppliedUpdate),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateMessage {
+    pub session_id: StreamSessionId,
+    pub sequence: u64,
     pub slot: Slot,
     pub is_leader: bool,
     pub content: MessageContent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip<T>(value: &T) -> T
+    where
+        T: Serialize + for<'de> Deserialize<'de>,
+    {
+        bincode::deserialize(&bincode::serialize(value).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn control_variants_roundtrip() {
+        let session_id = [7; 16];
+        let key = Pubkey::new_from_array([3; 32]);
+        let messages = [
+            ControlMessage::OpenStream {
+                protocol_version: STREAM_PROTOCOL_VERSION,
+                session_id,
+                config: SubscriptionConfig::default(),
+                pumpfun_hints: vec![key],
+            },
+            ControlMessage::SubscribeAccounts {
+                session_id,
+                request_id: 1,
+                accounts: vec![key],
+            },
+            ControlMessage::CompactAccounts {
+                session_id,
+                request_id: 2,
+                base_membership_generation: 4,
+                retain: vec![key],
+            },
+            ControlMessage::SetFilters {
+                session_id,
+                request_id: 3,
+                filters: Vec::new(),
+            },
+            ControlMessage::SetPumpfunHints {
+                session_id,
+                request_id: 4,
+                bonding_curves: vec![key],
+            },
+            ControlMessage::ReplayFrom {
+                session_id,
+                sequence: 9,
+            },
+        ];
+        for message in messages {
+            let _: ControlMessage = roundtrip(&message);
+        }
+    }
+
+    #[test]
+    fn sequenced_updates_roundtrip() {
+        let updates = [
+            MessageContent::StreamOpened(StreamOpenedUpdate {
+                protocol_version: STREAM_PROTOCOL_VERSION,
+                membership_generation: 3,
+                filter_generation: 4,
+                pumpfun_hint_generation: 5,
+            }),
+            MessageContent::AccountsActivated(AccountsActivatedUpdate {
+                request_id: 8,
+                membership_generation: 9,
+                slot: 100,
+                chunk_index: 0,
+                chunk_count: 1,
+                accounts: Vec::new(),
+                missing: vec![Pubkey::new_from_array([1; 32])],
+            }),
+            MessageContent::AccountsCompacted(AccountsCompactedUpdate {
+                request_id: 10,
+                membership_generation: 11,
+                physical_account_count: 12,
+            }),
+            MessageContent::ControlApplied(ControlAppliedUpdate {
+                request_id: 13,
+                kind: AppliedControlKind::PumpfunHints,
+                generation: 14,
+            }),
+        ];
+        for (index, content) in updates.into_iter().enumerate() {
+            let message = UpdateMessage {
+                session_id: [5; 16],
+                sequence: 42 + index as u64,
+                slot: 100,
+                is_leader: true,
+                content,
+            };
+            let decoded: UpdateMessage = roundtrip(&message);
+            assert_eq!(decoded.session_id, [5; 16]);
+            assert_eq!(decoded.sequence, 42 + index as u64);
+            assert_eq!(decoded.slot, 100);
+            assert!(decoded.is_leader);
+        }
+    }
+
+    #[test]
+    fn protocol_version_validation_rejects_mismatches() {
+        assert_eq!(validate_protocol_version(STREAM_PROTOCOL_VERSION), Ok(()));
+        assert_eq!(
+            validate_protocol_version(STREAM_PROTOCOL_VERSION + 1),
+            Err(UnsupportedProtocolVersion {
+                received: STREAM_PROTOCOL_VERSION + 1,
+                supported: STREAM_PROTOCOL_VERSION,
+            })
+        );
+    }
 }
