@@ -7,7 +7,7 @@ use {
 /// Maximum number of messages that can be sent from server to client after a single
 /// KeepAlive control message from the client.
 pub const MAX_MESSAGES_PER_KEEPALIVE: u64 = 10000;
-pub const STREAM_PROTOCOL_VERSION: u16 = 2;
+pub const STREAM_PROTOCOL_VERSION: u16 = 3;
 pub type StreamSessionId = [u8; 16];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,9 @@ pub enum ControlMessage {
         session_id: StreamSessionId,
         config: SubscriptionConfig,
         pumpfun_hints: Vec<Pubkey>,
+        /// Dedicated response sink for latency-sensitive simulations. Simulation
+        /// results never share the ordered account/transaction update stream.
+        simulation_results_sink: String,
     },
     SubscribeAccounts {
         session_id: StreamSessionId,
@@ -103,6 +106,7 @@ pub enum ControlMessage {
         threshold_bps: u16,
     },
     SimulateTx {
+        session_id: StreamSessionId,
         request_id: u64,
         tx: Vec<u8>,
         sig_verify: bool,
@@ -165,6 +169,21 @@ pub struct SimulateTxUpdate {
     pub units_consumed: u64,
     pub loaded_accounts_data_size: u32,
     pub fee: Option<u64>,
+}
+
+/// Messages sent on the dedicated simulation-result IPC channel.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum SimulationStreamMessage {
+    /// Mandatory first message, used to bind the response channel to the same
+    /// negotiated protocol and session as the ordered update stream.
+    Opened {
+        protocol_version: u16,
+        session_id: StreamSessionId,
+    },
+    Response {
+        session_id: StreamSessionId,
+        update: SimulateTxUpdate,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +268,7 @@ mod tests {
                 session_id,
                 config: SubscriptionConfig::default(),
                 pumpfun_hints: vec![key],
+                simulation_results_sink: "simulation-results".to_string(),
             },
             ControlMessage::SubscribeAccounts {
                 session_id,
@@ -275,10 +295,54 @@ mod tests {
                 session_id,
                 sequence: 9,
             },
+            ControlMessage::SimulateTx {
+                session_id,
+                request_id: 10,
+                tx: vec![1, 2, 3],
+                sig_verify: false,
+                replace_recent_blockhash: false,
+            },
         ];
         for message in messages {
             let _: ControlMessage = roundtrip(&message);
         }
+    }
+
+    #[test]
+    fn simulation_stream_roundtrip() {
+        let session_id = [9; 16];
+        let opened: SimulationStreamMessage = roundtrip(&SimulationStreamMessage::Opened {
+            protocol_version: STREAM_PROTOCOL_VERSION,
+            session_id,
+        });
+        assert!(matches!(
+            opened,
+            SimulationStreamMessage::Opened {
+                protocol_version: STREAM_PROTOCOL_VERSION,
+                session_id: decoded_session,
+            } if decoded_session == session_id
+        ));
+
+        let response: SimulationStreamMessage = roundtrip(&SimulationStreamMessage::Response {
+            session_id,
+            update: SimulateTxUpdate {
+                request_id: 11,
+                status: "success".to_string(),
+                slot: 12,
+                err: None,
+                logs: vec!["ok".to_string()],
+                units_consumed: 13,
+                loaded_accounts_data_size: 14,
+                fee: Some(15),
+            },
+        });
+        assert!(matches!(
+            response,
+            SimulationStreamMessage::Response {
+                session_id: decoded_session,
+                update: SimulateTxUpdate { request_id: 11, .. },
+            } if decoded_session == session_id
+        ));
     }
 
     #[test]
