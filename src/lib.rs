@@ -7,8 +7,17 @@ use {
 /// Maximum number of messages that can be sent from server to client after a single
 /// KeepAlive control message from the client.
 pub const MAX_MESSAGES_PER_KEEPALIVE: u64 = 10000;
-pub const STREAM_PROTOCOL_VERSION: u16 = 3;
+pub const STREAM_PROTOCOL_VERSION: u16 = 4;
 pub type StreamSessionId = [u8; 16];
+
+/// Controls how much execution detail a simulation returns. Classification mode
+/// preserves the fields needed to make an admission decision without retaining
+/// or transporting the transaction's complete program log.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub enum SimulationResultMode {
+    FullLogs,
+    Classification,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnsupportedProtocolVersion {
@@ -111,6 +120,7 @@ pub enum ControlMessage {
         tx: Vec<u8>,
         sig_verify: bool,
         replace_recent_blockhash: bool,
+        result_mode: SimulationResultMode,
     },
     /// A client must send KeepAlive periodically, one KeepAlive message sent allows for
     /// MAX_MESSAGES_PER_KEEPALIVE messages to be sent back from the server before another
@@ -159,6 +169,19 @@ pub struct TxWithAccountsUpdate {
     pub writable_accounts: Vec<AccountInfo>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SimulationFailureProvenance {
+    /// Top-level instruction index reported by the runtime.
+    pub instruction_index: Option<u32>,
+    /// Custom instruction error, when the runtime reported one.
+    pub custom_error: Option<u32>,
+    /// First program whose stable execution log reported failure.
+    pub failed_program_id: Option<Pubkey>,
+    /// Program active when the authenticated ARBER_PROFIT_GUARD_FAILURE marker
+    /// was emitted. A child program cannot forge its parent's identity here.
+    pub profit_guard_program_id: Option<Pubkey>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SimulateTxUpdate {
     pub request_id: u64,
@@ -169,6 +192,7 @@ pub struct SimulateTxUpdate {
     pub units_consumed: u64,
     pub loaded_accounts_data_size: u32,
     pub fee: Option<u64>,
+    pub failure_provenance: Option<SimulationFailureProvenance>,
 }
 
 /// Messages sent on the dedicated simulation-result IPC channel.
@@ -301,6 +325,7 @@ mod tests {
                 tx: vec![1, 2, 3],
                 sig_verify: false,
                 replace_recent_blockhash: false,
+                result_mode: SimulationResultMode::Classification,
             },
         ];
         for message in messages {
@@ -334,15 +359,26 @@ mod tests {
                 units_consumed: 13,
                 loaded_accounts_data_size: 14,
                 fee: Some(15),
+                failure_provenance: Some(SimulationFailureProvenance {
+                    instruction_index: Some(2),
+                    custom_error: Some(6000),
+                    failed_program_id: Some(Pubkey::new_from_array([4; 32])),
+                    profit_guard_program_id: Some(Pubkey::new_from_array([5; 32])),
+                }),
             },
         });
         assert!(matches!(
-            response,
+            &response,
             SimulationStreamMessage::Response {
                 session_id: decoded_session,
                 update: SimulateTxUpdate { request_id: 11, .. },
-            } if decoded_session == session_id
+            } if *decoded_session == session_id
         ));
+        if let SimulationStreamMessage::Response { update, .. } = response {
+            let provenance = update.failure_provenance.unwrap();
+            assert_eq!(provenance.instruction_index, Some(2));
+            assert_eq!(provenance.custom_error, Some(6000));
+        }
     }
 
     #[test]
