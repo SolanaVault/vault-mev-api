@@ -1,4 +1,5 @@
 use {
+    ipc_channel::ipc::IpcSender,
     serde::{Deserialize, Serialize},
     solana_clock::{Slot, UnixTimestamp},
     solana_pubkey::Pubkey,
@@ -7,7 +8,8 @@ use {
 /// Maximum number of messages that can be sent from server to client after a single
 /// KeepAlive control message from the client.
 pub const MAX_MESSAGES_PER_KEEPALIVE: u64 = 10000;
-pub const STREAM_PROTOCOL_VERSION: u16 = 4;
+pub const STREAM_PROTOCOL_VERSION: u16 = 5;
+pub const SIMULATION_CHANNEL_COUNT: usize = 2;
 pub type StreamSessionId = [u8; 16];
 
 /// Controls how much execution detail a simulation returns. Classification mode
@@ -108,24 +110,38 @@ pub enum ControlMessage {
         session_id: StreamSessionId,
         sequence: u64,
     },
-    SubmitTx {
-        tx: Vec<u8>,
-        enqueue: bool,
-        simulate: bool,
-        threshold_bps: u16,
-    },
-    SimulateTx {
-        session_id: StreamSessionId,
-        request_id: u64,
-        tx: Vec<u8>,
-        sig_verify: bool,
-        replace_recent_blockhash: bool,
-        result_mode: SimulationResultMode,
-    },
     /// A client must send KeepAlive periodically, one KeepAlive message sent allows for
     /// MAX_MESSAGES_PER_KEEPALIVE messages to be sent back from the server before another
     /// KeepAlive is required.
     KeepAlive,
+}
+
+/// Submission is always enqueued by the validator; this receiver must remain responsive.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubmitTxRequest {
+    pub session_id: StreamSessionId,
+    pub tx: Vec<u8>,
+    pub simulate: bool,
+    pub threshold_bps: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SimulateTxRequest {
+    pub session_id: StreamSessionId,
+    pub request_id: u64,
+    pub tx: Vec<u8>,
+    pub sig_verify: bool,
+    pub replace_recent_blockhash: bool,
+    pub result_mode: SimulationResultMode,
+}
+
+/// Persistent, independent request channels transferred through the IPC handshake.
+/// Every request must carry the negotiated session; a channel handle alone grants
+/// no authority to operate on a replacement session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionControlChannels {
+    pub submit: IpcSender<SubmitTxRequest>,
+    pub simulations: [IpcSender<SimulateTxRequest>; SIMULATION_CHANNEL_COUNT],
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -203,6 +219,7 @@ pub enum SimulationStreamMessage {
     Opened {
         protocol_version: u16,
         session_id: StreamSessionId,
+        transaction_channels: TransactionControlChannels,
     },
     Response {
         session_id: StreamSessionId,
@@ -319,14 +336,6 @@ mod tests {
                 session_id,
                 sequence: 9,
             },
-            ControlMessage::SimulateTx {
-                session_id,
-                request_id: 10,
-                tx: vec![1, 2, 3],
-                sig_verify: false,
-                replace_recent_blockhash: false,
-                result_mode: SimulationResultMode::Classification,
-            },
         ];
         for message in messages {
             let _: ControlMessage = roundtrip(&message);
@@ -336,17 +345,46 @@ mod tests {
     #[test]
     fn simulation_stream_roundtrip() {
         let session_id = [9; 16];
-        let opened: SimulationStreamMessage = roundtrip(&SimulationStreamMessage::Opened {
-            protocol_version: STREAM_PROTOCOL_VERSION,
-            session_id,
-        });
+        // Channel handles must be transferred through IPC, not bare bincode.
+        let (submit, submit_rx) = ipc_channel::ipc::channel().unwrap();
+        let (sim0, _sim0_rx) = ipc_channel::ipc::channel().unwrap();
+        let (sim1, _sim1_rx) = ipc_channel::ipc::channel().unwrap();
+        let (handshake_tx, handshake_rx) = ipc_channel::ipc::channel().unwrap();
+        handshake_tx
+            .send(SimulationStreamMessage::Opened {
+                protocol_version: STREAM_PROTOCOL_VERSION,
+                session_id,
+                transaction_channels: TransactionControlChannels {
+                    submit,
+                    simulations: [sim0, sim1],
+                },
+            })
+            .unwrap();
+        let opened = handshake_rx.recv().unwrap();
         assert!(matches!(
-            opened,
+            &opened,
             SimulationStreamMessage::Opened {
                 protocol_version: STREAM_PROTOCOL_VERSION,
                 session_id: decoded_session,
-            } if decoded_session == session_id
+                ..
+            } if *decoded_session == session_id
         ));
+        if let SimulationStreamMessage::Opened {
+            transaction_channels,
+            ..
+        } = opened
+        {
+            transaction_channels
+                .submit
+                .send(SubmitTxRequest {
+                    session_id,
+                    tx: vec![1, 2],
+                    simulate: false,
+                    threshold_bps: 1000,
+                })
+                .unwrap();
+            assert_eq!(submit_rx.recv().unwrap().tx, vec![1, 2]);
+        }
 
         let response: SimulationStreamMessage = roundtrip(&SimulationStreamMessage::Response {
             session_id,
