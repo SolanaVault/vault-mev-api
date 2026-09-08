@@ -8,7 +8,9 @@ use {
 /// Maximum number of messages that can be sent from server to client after a single
 /// KeepAlive control message from the client.
 pub const MAX_MESSAGES_PER_KEEPALIVE: u64 = 10000;
-pub const STREAM_PROTOCOL_VERSION: u16 = 5;
+/// v6: every `SubmitTxRequest` carries a client `request_id`, and the validator answers each
+/// submission with a `SimulationStreamMessage::SubmitResult` on the dedicated result stream.
+pub const STREAM_PROTOCOL_VERSION: u16 = 6;
 pub const SIMULATION_CHANNEL_COUNT: usize = 2;
 pub type StreamSessionId = [u8; 16];
 
@@ -117,12 +119,46 @@ pub enum ControlMessage {
 }
 
 /// Submission is always enqueued by the validator; this receiver must remain responsive.
+/// The outcome of every request is reported back as a [`SubmitTxResult`] carrying the same
+/// `request_id` on the dedicated result stream, including requests the validator rejects
+/// before execution (not leader, slot tail, deserialization).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubmitTxRequest {
     pub session_id: StreamSessionId,
+    /// Client-chosen correlation id, echoed on the matching [`SubmitTxResult`].
+    pub request_id: u64,
     pub tx: Vec<u8>,
     pub simulate: bool,
     pub threshold_bps: u16,
+}
+
+/// Terminal outcome of one [`SubmitTxRequest`] as seen by the validator's leader bank.
+///
+/// `status` is the validator's `SubmitTransactionStatus` name (`success`, `not_leader`,
+/// `too_close_to_end_of_slot`, `execution_failed`, `account_in_use`, ...). `success` with
+/// `simulate=false` means the transaction was recorded and committed into the validator's own
+/// block at `slot`; with `simulate=true` it means the dry run executed cleanly. Any other
+/// status means the transaction will never land from this submission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTxResult {
+    pub request_id: u64,
+    pub status: String,
+    /// Leader bank slot the request was processed against; 0 when no leader bank existed.
+    pub slot: Slot,
+    /// Runtime error text for `execution_failed`, or the rejection reason for the other
+    /// non-success statuses when the validator has one.
+    pub err: Option<String>,
+    /// Compute units the transaction consumed when it executed (success or execution failure).
+    pub units_consumed: u64,
+    /// Lamport change of the arber WSOL account across the whole transaction, when the validator
+    /// recognised an arber instruction and the transaction executed.
+    pub profit_lamports: Option<i64>,
+    /// Instruction-level attribution of an `execution_failed` outcome. Submissions execute
+    /// without log recording, so `profit_guard_program_id` is never proven here; callers must
+    /// pair `instruction_index`/`custom_error` with their own instruction list.
+    pub failure_provenance: Option<SimulationFailureProvenance>,
+    /// First signature of the submitted transaction, when it deserialized.
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,6 +260,11 @@ pub enum SimulationStreamMessage {
     Response {
         session_id: StreamSessionId,
         update: SimulateTxUpdate,
+    },
+    /// Terminal outcome of one `SubmitTxRequest`, matched by `result.request_id`.
+    SubmitResult {
+        session_id: StreamSessionId,
+        result: SubmitTxResult,
     },
 }
 
@@ -378,12 +419,15 @@ mod tests {
                 .submit
                 .send(SubmitTxRequest {
                     session_id,
+                    request_id: 21,
                     tx: vec![1, 2],
                     simulate: false,
                     threshold_bps: 1000,
                 })
                 .unwrap();
-            assert_eq!(submit_rx.recv().unwrap().tx, vec![1, 2]);
+            let received = submit_rx.recv().unwrap();
+            assert_eq!(received.request_id, 21);
+            assert_eq!(received.tx, vec![1, 2]);
         }
 
         let response: SimulationStreamMessage = roundtrip(&SimulationStreamMessage::Response {
@@ -417,6 +461,43 @@ mod tests {
             assert_eq!(provenance.instruction_index, Some(2));
             assert_eq!(provenance.custom_error, Some(6000));
         }
+
+        let submit_result: SimulationStreamMessage =
+            roundtrip(&SimulationStreamMessage::SubmitResult {
+                session_id,
+                result: SubmitTxResult {
+                    request_id: 21,
+                    status: "execution_failed".to_string(),
+                    slot: 33,
+                    err: Some("InstructionError(3, Custom(6001))".to_string()),
+                    units_consumed: 44,
+                    profit_lamports: Some(-5),
+                    failure_provenance: Some(SimulationFailureProvenance {
+                        instruction_index: Some(3),
+                        custom_error: Some(6001),
+                        failed_program_id: Some(Pubkey::new_from_array([6; 32])),
+                        profit_guard_program_id: None,
+                    }),
+                    signature: Some("sig".to_string()),
+                },
+            });
+        let SimulationStreamMessage::SubmitResult {
+            session_id: decoded_session,
+            result,
+        } = submit_result
+        else {
+            panic!("submit result variant expected");
+        };
+        assert_eq!(decoded_session, session_id);
+        assert_eq!(result.request_id, 21);
+        assert_eq!(result.status, "execution_failed");
+        assert_eq!(result.slot, 33);
+        assert_eq!(result.units_consumed, 44);
+        assert_eq!(result.profit_lamports, Some(-5));
+        assert_eq!(
+            result.failure_provenance.unwrap().custom_error,
+            Some(6001)
+        );
     }
 
     #[test]
