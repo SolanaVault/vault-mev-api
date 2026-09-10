@@ -10,7 +10,10 @@ use {
 pub const MAX_MESSAGES_PER_KEEPALIVE: u64 = 10000;
 /// v6: every `SubmitTxRequest` carries a client `request_id`, and the validator answers each
 /// submission with a `SimulationStreamMessage::SubmitResult` on the dedicated result stream.
-pub const STREAM_PROTOCOL_VERSION: u16 = 6;
+/// v7: `SimulateTxRequest::post_accounts` names accounts whose post-execution images the
+/// validator returns in `SimulateTxUpdate::post_accounts`, so an oracle refresh can be strictly
+/// simulated and certified on the validator's working bank instead of over HTTP RPC.
+pub const STREAM_PROTOCOL_VERSION: u16 = 7;
 pub const SIMULATION_CHANNEL_COUNT: usize = 2;
 pub type StreamSessionId = [u8; 16];
 
@@ -169,6 +172,10 @@ pub struct SimulateTxRequest {
     pub sig_verify: bool,
     pub replace_recent_blockhash: bool,
     pub result_mode: SimulationResultMode,
+    /// Accounts whose post-execution images are returned (v7). Empty requests none. The
+    /// validator returns every requested account it loaded, in request order; a requested
+    /// account the transaction did not load is omitted.
+    pub post_accounts: Vec<Pubkey>,
 }
 
 /// Persistent, independent request channels transferred through the IPC handshake.
@@ -245,6 +252,8 @@ pub struct SimulateTxUpdate {
     pub loaded_accounts_data_size: u32,
     pub fee: Option<u64>,
     pub failure_provenance: Option<SimulationFailureProvenance>,
+    /// Post-execution images of the requested `post_accounts` (v7), in request order.
+    pub post_accounts: Vec<AccountInfo>,
 }
 
 /// Messages sent on the dedicated simulation-result IPC channel.
