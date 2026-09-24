@@ -13,7 +13,13 @@ pub const MAX_MESSAGES_PER_KEEPALIVE: u64 = 10000;
 /// v7: `SimulateTxRequest::post_accounts` names accounts whose post-execution images the
 /// validator returns in `SimulateTxUpdate::post_accounts`, so an oracle refresh can be strictly
 /// simulated and certified on the validator's working bank instead of over HTTP RPC.
-pub const STREAM_PROTOCOL_VERSION: u16 = 7;
+/// v8: a `SubmitTxRequest` may carry a [`StandingPolicy`]. A submission that executes without
+/// landing then stays registered on the validator and is re-executed, on the leader bank, every
+/// time another committed leader-bank transaction writes one of its `watch` accounts, until it
+/// lands, runs out of attempts, or `until_slot` passes. Each execution is reported as its own
+/// `SubmitTxResult`; `standing` on the result says whether the entry is still registered.
+/// `ControlMessage::CancelStanding` withdraws an entry early.
+pub const STREAM_PROTOCOL_VERSION: u16 = 8;
 pub const SIMULATION_CHANNEL_COUNT: usize = 2;
 pub type StreamSessionId = [u8; 16];
 
@@ -119,6 +125,13 @@ pub enum ControlMessage {
     /// MAX_MESSAGES_PER_KEEPALIVE messages to be sent back from the server before another
     /// KeepAlive is required.
     KeepAlive,
+    /// Withdraw a standing submission (v8). The validator answers with a final
+    /// `SubmitTxResult` of status `standing_cancelled` when the entry was still registered; an
+    /// entry that already reached a terminal result has nothing to answer.
+    CancelStanding {
+        session_id: StreamSessionId,
+        request_id: u64,
+    },
 }
 
 /// Submission is always enqueued by the validator; this receiver must remain responsive.
@@ -133,6 +146,29 @@ pub struct SubmitTxRequest {
     pub tx: Vec<u8>,
     pub simulate: bool,
     pub threshold_bps: u16,
+    /// Keep the submission registered for re-execution on touch after a non-landing first
+    /// attempt (v8). `None` is the classic one-shot submission. Ignored for `simulate=true`.
+    pub standing: Option<StandingPolicy>,
+}
+
+/// How long, and how often, the validator may re-execute a submission that did not land on its
+/// first attempt (v8).
+///
+/// The validator re-executes the same signed bytes whenever a committed transaction in one of
+/// its own leader banks writes any account in `watch`. A failed execution is never recorded,
+/// so a profit-guard revert costs nothing but validator time and the signature stays free to
+/// go again; a landed copy makes later attempts fail as already processed and removes the
+/// entry. The validator clamps `max_attempts` to its own ceiling and refuses registration when
+/// its registry is full, reporting either through `SubmitTxResult::standing`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StandingPolicy {
+    /// Last slot, inclusive, in which a re-execution may run. Entries past it are removed with
+    /// a final `standing_expired` result.
+    pub until_slot: Slot,
+    /// Re-executions allowed after the initial attempt.
+    pub max_attempts: u32,
+    /// Accounts whose commit by another leader-bank transaction re-triggers the submission.
+    pub watch: Vec<Pubkey>,
 }
 
 /// Terminal outcome of one [`SubmitTxRequest`] as seen by the validator's leader bank.
@@ -141,7 +177,11 @@ pub struct SubmitTxRequest {
 /// `too_close_to_end_of_slot`, `execution_failed`, `account_in_use`, ...). `success` with
 /// `simulate=false` means the transaction was recorded and committed into the validator's own
 /// block at `slot`; with `simulate=true` it means the dry run executed cleanly. Any other
-/// status means the transaction will never land from this submission.
+/// status means the transaction will never land from this submission — unless `standing` is
+/// true (v8), in which case the validator still holds the entry and further results for the
+/// same `request_id` follow, one per re-execution, until one arrives with `standing=false`.
+/// Standing-only statuses: `standing_expired` (`until_slot` passed) and `standing_cancelled`
+/// (withdrawn by `ControlMessage::CancelStanding`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitTxResult {
     pub request_id: u64,
@@ -162,7 +202,18 @@ pub struct SubmitTxResult {
     pub failure_provenance: Option<SimulationFailureProvenance>,
     /// First signature of the submitted transaction, when it deserialized.
     pub signature: Option<String>,
+    /// Which execution this result reports (v8): 0 is the initial submission, `n` the n-th
+    /// standing re-execution.
+    pub attempt: u32,
+    /// The entry remains registered for further re-executions (v8); `false` marks the last
+    /// result this `request_id` will ever produce.
+    pub standing: bool,
 }
+
+/// Status name of the final result of a standing entry whose `until_slot` passed.
+pub const STANDING_EXPIRED_STATUS: &str = "standing_expired";
+/// Status name of the final result of a standing entry withdrawn by `CancelStanding`.
+pub const STANDING_CANCELLED_STATUS: &str = "standing_cancelled";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SimulateTxRequest {
@@ -432,11 +483,20 @@ mod tests {
                     tx: vec![1, 2],
                     simulate: false,
                     threshold_bps: 1000,
+                    standing: Some(StandingPolicy {
+                        until_slot: 40,
+                        max_attempts: 5,
+                        watch: vec![Pubkey::new_from_array([9; 32])],
+                    }),
                 })
                 .unwrap();
             let received = submit_rx.recv().unwrap();
             assert_eq!(received.request_id, 21);
             assert_eq!(received.tx, vec![1, 2]);
+            let standing = received.standing.unwrap();
+            assert_eq!(standing.until_slot, 40);
+            assert_eq!(standing.max_attempts, 5);
+            assert_eq!(standing.watch, vec![Pubkey::new_from_array([9; 32])]);
         }
 
         let response: SimulationStreamMessage = roundtrip(&SimulationStreamMessage::Response {
@@ -450,6 +510,7 @@ mod tests {
                 units_consumed: 13,
                 loaded_accounts_data_size: 14,
                 fee: Some(15),
+                post_accounts: Vec::new(),
                 failure_provenance: Some(SimulationFailureProvenance {
                     instruction_index: Some(2),
                     custom_error: Some(6000),
@@ -488,6 +549,8 @@ mod tests {
                         profit_guard_program_id: None,
                     }),
                     signature: Some("sig".to_string()),
+                    attempt: 2,
+                    standing: true,
                 },
             });
         let SimulationStreamMessage::SubmitResult {
@@ -507,6 +570,20 @@ mod tests {
             result.failure_provenance.unwrap().custom_error,
             Some(6001)
         );
+        assert_eq!(result.attempt, 2);
+        assert!(result.standing);
+
+        let cancel: ControlMessage = roundtrip(&ControlMessage::CancelStanding {
+            session_id,
+            request_id: 21,
+        });
+        assert!(matches!(
+            cancel,
+            ControlMessage::CancelStanding {
+                session_id: decoded,
+                request_id: 21
+            } if decoded == session_id
+        ));
     }
 
     #[test]
