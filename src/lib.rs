@@ -19,7 +19,12 @@ pub const MAX_MESSAGES_PER_KEEPALIVE: u64 = 10000;
 /// lands, runs out of attempts, or `until_slot` passes. Each execution is reported as its own
 /// `SubmitTxResult`; `standing` on the result says whether the entry is still registered.
 /// `ControlMessage::CancelStanding` withdraws an entry early.
-pub const STREAM_PROTOCOL_VERSION: u16 = 8;
+/// v9: transactions and account activations identify their session-local bank; bank lifecycle
+/// events carry ancestry, full Clock state and explicit abandonment. Submit success identifies
+/// a local commit, while a rooted bank or rooted descendant proves its finality. Transactions
+/// carry their executing Clock; Frozen events carry the post-footer Clock inherited by a child.
+/// Both peers must upgrade together; v8 cannot represent these fields.
+pub const STREAM_PROTOCOL_VERSION: u16 = 9;
 pub const SIMULATION_CHANNEL_COUNT: usize = 2;
 pub type StreamSessionId = [u8; 16];
 
@@ -184,6 +189,8 @@ pub struct StandingPolicy {
 /// (withdrawn by `ControlMessage::CancelStanding`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitTxResult {
+    /// Node-local bank identity; interpreted only within this stream session.
+    pub bank_id: Option<u64>,
     pub request_id: u64,
     pub status: String,
     /// Leader bank slot the request was processed against; 0 when no leader bank existed.
@@ -246,6 +253,49 @@ pub struct AccountInfo {
     pub data: Vec<u8>,
 }
 
+/// Full program-visible Clock. A frozen bank's Clock is the context inherited by its child.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionClock {
+    pub slot: Slot,
+    pub epoch_start_timestamp: UnixTimestamp,
+    pub epoch: u64,
+    pub leader_schedule_epoch: u64,
+    pub unix_timestamp: UnixTimestamp,
+}
+
+/// Bank IDs are opaque, node-local, and scoped to the enclosing stream session.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BankContext {
+    pub parent_block_id: Option<[u8; 32]>,
+    pub bank_id: u64,
+    pub parent_bank_id: Option<u64>,
+    pub parent_slot: Slot,
+    pub clock: ExecutionClock,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BankEventKind {
+    Created,
+    Frozen,
+    Confirmed,
+    Rooted,
+    Abandoned,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BankEvent {
+    pub recent_blockhash: Option<[u8; 32]>,
+    pub alpenglow: bool,
+    pub block_id: Option<[u8; 32]>,
+    pub slot: Slot,
+    pub bank_id: u64,
+    pub parent_slot: Option<Slot>,
+    pub parent_bank_id: Option<u64>,
+    /// Created: executing Clock. Frozen: post-footer Clock. Other events may omit it.
+    pub clock: Option<ExecutionClock>,
+    pub kind: BankEventKind,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SlotUpdate {
     pub slot: Slot,
@@ -270,6 +320,8 @@ pub enum SlotStatus {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TxWithAccountsUpdate {
+    /// Executing Clock and parent identity captured before the bank footer.
+    pub bank: Option<BankContext>,
     pub signature: String,
     pub is_vote: bool,
     pub status: String,
@@ -338,6 +390,7 @@ pub struct StreamOpenedUpdate {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountsActivatedUpdate {
+    pub bank_id: Option<u64>,
     pub request_id: u64,
     pub membership_generation: u64,
     /// Completed-bank slot used for the authoritative account image.
@@ -372,6 +425,7 @@ pub struct ControlAppliedUpdate {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MessageContent {
     StreamOpened(StreamOpenedUpdate),
+    Bank(BankEvent),
     Slot(SlotUpdate),
     TransactionWithAccounts(Vec<TxWithAccountsUpdate>),
     SimulateTx(SimulateTxUpdate),
@@ -536,6 +590,7 @@ mod tests {
             roundtrip(&SimulationStreamMessage::SubmitResult {
                 session_id,
                 result: SubmitTxResult {
+                    bank_id: None,
                     request_id: 21,
                     status: "execution_failed".to_string(),
                     slot: 33,
@@ -566,10 +621,7 @@ mod tests {
         assert_eq!(result.slot, 33);
         assert_eq!(result.units_consumed, 44);
         assert_eq!(result.profit_lamports, Some(-5));
-        assert_eq!(
-            result.failure_provenance.unwrap().custom_error,
-            Some(6001)
-        );
+        assert_eq!(result.failure_provenance.unwrap().custom_error, Some(6001));
         assert_eq!(result.attempt, 2);
         assert!(result.standing);
 
@@ -596,6 +648,7 @@ mod tests {
                 pumpfun_hint_generation: 5,
             }),
             MessageContent::AccountsActivated(AccountsActivatedUpdate {
+                bank_id: None,
                 request_id: 8,
                 membership_generation: 9,
                 slot: 100,
@@ -634,6 +687,10 @@ mod tests {
     #[test]
     fn protocol_version_validation_rejects_mismatches() {
         assert_eq!(validate_protocol_version(STREAM_PROTOCOL_VERSION), Ok(()));
+        assert!(
+            validate_protocol_version(8).is_err(),
+            "v8 cannot carry bank identity or finality"
+        );
         assert_eq!(
             validate_protocol_version(STREAM_PROTOCOL_VERSION + 1),
             Err(UnsupportedProtocolVersion {
@@ -641,5 +698,45 @@ mod tests {
                 supported: STREAM_PROTOCOL_VERSION,
             })
         );
+    }
+
+    #[test]
+    fn bank_identity_parent_and_full_clocks_roundtrip() {
+        let clock = ExecutionClock {
+            slot: 432_003,
+            epoch: 1,
+            leader_schedule_epoch: 2,
+            epoch_start_timestamp: 1234,
+            unix_timestamp: 1234,
+        };
+        let context = BankContext {
+            parent_block_id: Some([4; 32]),
+            bank_id: 3,
+            parent_bank_id: Some(99),
+            parent_slot: 431_995,
+            clock,
+        };
+        assert_eq!(roundtrip::<BankContext>(&context), context);
+        for kind in [
+            BankEventKind::Created,
+            BankEventKind::Frozen,
+            BankEventKind::Confirmed,
+            BankEventKind::Rooted,
+            BankEventKind::Abandoned,
+        ] {
+            let event = BankEvent {
+                recent_blockhash: Some([5; 32]),
+                alpenglow: true,
+                block_id: Some([6; 32]),
+                slot: clock.slot,
+                bank_id: 3,
+                parent_slot: Some(431_995),
+                parent_bank_id: Some(99),
+                clock: Some(clock),
+                kind,
+            };
+            let content: MessageContent = roundtrip(&MessageContent::Bank(event));
+            assert!(matches!(content,MessageContent::Bank(decoded) if decoded==event));
+        }
     }
 }
