@@ -24,7 +24,12 @@ pub const MAX_MESSAGES_PER_KEEPALIVE: u64 = 10000;
 /// a local commit, while a rooted bank or rooted descendant proves its finality. Transactions
 /// carry their executing Clock; Frozen events carry the post-footer Clock inherited by a child.
 /// Both peers must upgrade together; v8 cannot represent these fields.
-pub const STREAM_PROTOCOL_VERSION: u16 = 9;
+/// v10: every `SubmitTxRequest` carries a `priority`. The validator runs submissions that share a
+/// fee payer one at a time, and gives the turn to the waiting submission with the highest
+/// priority (ties in arrival order), including the copies it held for the leader bank, which all
+/// become runnable the moment that bank opens; a standing entry keeps its request's priority for
+/// every re-execution. Both peers must upgrade together.
+pub const STREAM_PROTOCOL_VERSION: u16 = 10;
 pub const SIMULATION_CHANNEL_COUNT: usize = 2;
 pub type StreamSessionId = [u8; 16];
 
@@ -154,6 +159,12 @@ pub struct SubmitTxRequest {
     /// Keep the submission registered for re-execution on touch after a non-landing first
     /// attempt (v8). `None` is the classic one-shot submission. Ignored for `simulate=true`.
     pub standing: Option<StandingPolicy>,
+    /// Order among this client's submissions that share a fee payer (v10): when several wait for
+    /// the payer, the highest priority runs first, ties in arrival order. The validator compares
+    /// it only with other submissions of the same fee payer, so the unit is the client's own
+    /// (the arber client sends the expected profit in lamports, and 0 or 1 for copies whose
+    /// value is not a current quote). It never reorders anyone else's transactions.
+    pub priority: u64,
 }
 
 /// How long, and how often, the validator may re-execute a submission that did not land on its
@@ -542,11 +553,13 @@ mod tests {
                         max_attempts: 5,
                         watch: vec![Pubkey::new_from_array([9; 32])],
                     }),
+                    priority: 2_179_562_846,
                 })
                 .unwrap();
             let received = submit_rx.recv().unwrap();
             assert_eq!(received.request_id, 21);
             assert_eq!(received.tx, vec![1, 2]);
+            assert_eq!(received.priority, 2_179_562_846);
             let standing = received.standing.unwrap();
             assert_eq!(standing.until_slot, 40);
             assert_eq!(standing.max_attempts, 5);
